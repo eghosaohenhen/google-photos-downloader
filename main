@@ -1,0 +1,158 @@
+import os
+import requests
+import json
+import zipfile
+from datetime import datetime
+import mimetypes
+import argparse
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+# Scopes for accessing Google Photos
+SCOPES = ['https://www.googleapis.com/auth/photoslibrary.readonly']
+
+
+def authenticate_google_photos(account_name, secret_path):
+    """Authenticate and return the Google Photos API service."""
+    token_file = f'token_{account_name}.json'
+    creds = None
+    
+    # Check if the token for this account exists
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                secret_path, SCOPES)
+            creds = flow.run_local_server(port=61825)
+        # Save the token for this account
+        with open(token_file, 'w') as token:
+            token.write(creds.to_json())
+    if creds and creds.valid:
+        print("Credentials are valid.")
+    else:
+        print("Failed to obtain valid credentials.")
+    return build('photoslibrary', 'v1', credentials=creds, static_discovery=False)
+
+def download_file(url, filepath):
+    """Download a file from a given URL and save it to the specified filepath."""
+    response = requests.get(url)
+    if response.status_code == 200:
+        with open(filepath, 'wb') as f:
+            f.write(response.content)
+            print(f"Finished downloading file")
+    else:
+        print(f"Failed to download file: {response.status_code}")
+def get_extension_from_mime(mime_type):
+    return mimetypes.guess_extension(mime_type)
+
+
+
+def organize_photos_by_date(service, output_dir, dry_run=False):
+    """Download and organize Google Photos by year, month, and day."""
+    next_page_token = None
+    os.makedirs(output_dir, exist_ok=True)
+    
+    while True:
+        results = service.mediaItems().list(pageSize=100, pageToken=next_page_token).execute()
+        media_items = results.get('mediaItems', [])
+        print(f"Downloading {len(media_items)} media items...")
+        
+        for item in media_items:
+            if dry_run:
+                print(f"[DRY RUN] Would download {item['filename']}")
+                print(f"[DRY RUN] Full response for item: {item}")
+                continue
+            print(f"Processing media file: {item['filename']}")
+            filename = item['filename']
+            base_url = item['baseUrl']
+            media_metadata = item.get('mediaMetadata', {})
+            creation_time = media_metadata.get('creationTime', None)
+            mime_type = item.get('mimeType', '')
+
+            if creation_time:
+                # Extract year, month, and day
+                date_obj = datetime.fromisoformat(creation_time)
+                year = date_obj.year
+                month = date_obj.strftime("%m")
+                day = date_obj.strftime("%d")
+                
+                # Create directories
+                date_dir = os.path.join(output_dir, str(year), month, day)
+                os.makedirs(date_dir, exist_ok=True)
+                
+                if "video" in mime_type:
+                    # Video file: download directly
+                    download_video(base_url + "=dv", mime_type, date_dir, filename)
+                elif "image" in mime_type:
+                    # Check if it is a live photo
+                    video_url = base_url + "=dv"
+                    image_url = base_url + "=d"
+                    
+                    # Attempt to download both image and video
+                    video_response = requests.get(video_url)
+                    if video_response.status_code == 200:
+                        print(f"Detected live photo: {filename} in {date_dir}...")
+                        # Live photo: download as ZIP
+                        # download_as_zip(output_dir, date_dir, filename, image_url, video_response, mime_type)
+                        download_image(image_url, mime_type, date_dir, filename)
+                        download_video(video_url, mime_type, date_dir, filename)
+                        
+                    else:
+                        # Regular photo: download image
+                        download_image(image_url, mime_type, date_dir, filename)
+                else:
+                    print(f"Skipping unsupported media type: {mime_type}")
+            else:
+                print(f"Skipping media item without creation time: {filename}")       
+        next_page_token = results.get('nextPageToken', None)
+        if not next_page_token:
+            break
+def download_video(video_url, mime_type, date_dir, filename):
+    """Download a video from a given URL and save it to the specified filepath."""
+    file_extension = get_extension_from_mime(mime_type) or ".mp4"
+    file_path = os.path.join(date_dir, f"{os.path.splitext(filename)[0]}{file_extension}")
+    if os.path.exists(file_path):
+        print(f"Skipping, file already exists: {filename}")
+        return
+    print(f"Downloading video: {filename} to {date_dir}...")
+    download_file(video_url, file_path)
+    
+def download_image(image_url, mime_type, date_dir, filename):
+    """Download an image from a given URL and save it to the specified filepath."""
+    image_extension = get_extension_from_mime(mime_type) or ".jpg"
+    file_path = os.path.join(date_dir, f"{os.path.splitext(filename)[0]}{image_extension}")
+    if os.path.exists(file_path):
+        print(f"Skipping, file already exists: {filename}")
+        return
+    print(f"Downloading image: {filename} to {date_dir}...")
+    download_file(image_url, file_path)
+
+
+if __name__ == '__main__':
+    # # Prompt the user for account name and output directory
+    
+    # account_name = input("Enter the account name to use (e.g., john_doe): ").strip()
+    # output_directory = input("Enter the folder where photos should be downloaded: ").strip()
+    
+    
+    # Set up command-line argument parsing
+    parser = argparse.ArgumentParser(description="Download and organize Google Photos by date.")
+    parser.add_argument("--account", required=True, help="The Google account name to use (e.g., john_doe).")
+    parser.add_argument("--output", required=True, help="The directory where photos should be downloaded.")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate the script's actions without downloading files.")
+    
+    args = parser.parse_args()
+    secret_path = input("Enter the path to the client secret file: ").strip()
+    # Authenticate and initialize Google Photos API
+    print(f"Authenticating for account: {args.account}")
+    service = authenticate_google_photos(args.account, secret_path)
+    
+    # Organize and download photos by year, month, and day
+    print(f"{'Simulating download' if args.dry_run else 'Downloading photos'} to: {args.output}")
+    organize_photos_by_date(service, args.output, args.dry_run)
+    print("Done!")
